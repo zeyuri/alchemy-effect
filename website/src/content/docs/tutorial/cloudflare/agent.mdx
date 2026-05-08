@@ -1,0 +1,282 @@
+---
+title: Add a Chat Agent
+description: Wrap Workers AI as a typed LanguageModel, then store conversation history in a Durable Object so each chat session survives restarts.
+sidebar:
+  order: 7
+---
+
+The [AI Gateway tutorial](/tutorial/cloudflare/ai-gateway) routed a
+single one-shot inference call through your gateway. Real chat apps
+need two more things: a typed handle to the model so you can compose
+generations with the rest of your Effect code, and somewhere to keep
+the conversation between turns. This tutorial wires both — a
+`Cloudflare.AiGatewayLanguageModel` for the model, and a Durable
+Object whose `state.storage` backs Effect's `Chat.Persistence` so
+each chat instance is its own resumable session.
+
+## Wrap the gateway as a `LanguageModel`
+
+Effect's AI SDK is built around a single `LanguageModel.LanguageModel`
+service — every provider (OpenAI, Anthropic, Workers AI, …) ships a
+layer that produces one. Alchemy includes a Workers AI adapter that
+wraps the AI Gateway client into the same shape:
+
+```typescript
+// src/Api.ts
+import * as Cloudflare from "alchemy/Cloudflare";
+import { Gateway } from "./AiGateway.ts";
+
+const aiGateway = yield* Cloudflare.AiGateway.bind(Gateway);
+const languageModel = Cloudflare.AiGatewayLanguageModel.layer({
+  client: aiGateway,
+  model: "@cf/meta/llama-3.1-8b-instruct",
+  parameters: { temperature: 0.7, maxTokens: 1024 },
+});
+```
+
+The returned `Layer<LanguageModel.LanguageModel, never, WorkerEnvironment>`
+wires the standard `generateText` / `streamText` / `generateObject`
+APIs straight to Workers AI through your gateway — caching, rate
+limiting, and logs all still apply.
+
+## Generate one-shot text
+
+Provide the layer to a route and call `LanguageModel.generateText`:
+
+```diff lang="typescript"
+// src/Api.ts
+import * as Cloudflare from "alchemy/Cloudflare";
+import * as Effect from "effect/Effect";
++import { LanguageModel } from "effect/unstable/ai";
+import { HttpServerRequest } from "effect/unstable/http/HttpServerRequest";
+import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse";
+import { Gateway } from "./AiGateway.ts";
+
+export default class Api extends Cloudflare.Worker<Api>()(
+  "Api",
+  { main: import.meta.path },
+  Effect.gen(function* () {
+    const aiGateway = yield* Cloudflare.AiGateway.bind(Gateway);
++   const languageModel = Cloudflare.AiGatewayLanguageModel.layer({
++     client: aiGateway,
++     model: "@cf/meta/llama-3.1-8b-instruct",
++   });
+
+    return {
+      fetch: Effect.gen(function* () {
+        const request = yield* HttpServerRequest;
+        const url = new URL(request.url, "http://api");
+        const prompt = url.searchParams.get("prompt") ?? "Say hello.";
+
++       if (url.pathname === "/generate") {
++         const response = yield* LanguageModel.generateText({ prompt }).pipe(
++           Effect.orDie,
++         );
++         return yield* HttpServerResponse.json({ text: response.text });
++       }
+
+        return HttpServerResponse.text("Not Found", { status: 404 });
++     }).pipe(Effect.provide(languageModel)),
+    };
+  }).pipe(Effect.provide(Cloudflare.AiGatewayBindingLive)),
+) {}
+```
+
+`Effect.provide(languageModel)` installs the model layer for the
+fetch handler. From there `LanguageModel.generateText` (and
+`streamText`) Just Work — typed errors, structured response parts,
+and full Effect composition.
+
+## Stateful chat needs persistence
+
+A one-shot `generateText` forgets everything after it returns. To
+have a conversation, you need to keep `[user, assistant, user, …]`
+turns and replay them on each request. Effect ships exactly that
+abstraction — `Chat.Service` — but it needs somewhere to store the
+history. The natural fit on Cloudflare is a Durable Object: each DO
+instance is one chat session, and its `state.storage` survives
+restarts and hibernation.
+
+Alchemy provides `Cloudflare.DurableObjectBackingPersistence.layer`
+— a Layer that satisfies Effect's `BackingPersistence` interface
+using the DO's own storage. Stack `Chat.layerPersisted` on top and
+you have a fully persistent chat store with no extra infrastructure.
+
+## Create the `ChatAgent` DO
+
+Create `src/ChatAgent.ts`. The outer init phase binds the AI
+Gateway and constructs the model layer:
+
+```typescript
+// src/ChatAgent.ts
+import * as Cloudflare from "alchemy/Cloudflare";
+import * as Effect from "effect/Effect";
+import { Gateway } from "./AiGateway.ts";
+
+export default class ChatAgent extends Cloudflare.DurableObjectNamespace<ChatAgent>()(
+  "ChatAgent",
+  Effect.gen(function* () {
+    const aiGateway = yield* Cloudflare.AiGateway.bind(Gateway);
+    const languageModel = Cloudflare.AiGatewayLanguageModel.layer({
+      client: aiGateway,
+      model: "@cf/meta/llama-3.1-8b-instruct",
+      parameters: { temperature: 0, maxTokens: 256 },
+    });
+
+    return Effect.gen(function* () {
+      // per-instance setup — added below
+      return {};
+    });
+  }),
+) {}
+```
+
+The outer `Effect.gen` runs once when the DO class is bound to a
+Worker; the inner one runs every time a new DO instance is
+constructed.
+
+## Wire persistence in the instance phase
+
+Inside the inner Effect, stack the persistence layers and resolve a
+single `Chat` for this DO instance:
+
+```diff lang="typescript"
+return Effect.gen(function* () {
++  const persistence = yield* Chat.Persistence;
++  const chat = yield* persistence.getOrCreate("session");
+  return {};
++}).pipe(
++  Effect.provide(languageModel),
++  Effect.provide(Chat.layerPersisted({ storeId: "chat" })),
++  Effect.provide(Cloudflare.DurableObjectBackingPersistence.layer),
++);
+```
+
+Reading bottom-up, the layer chain is:
+
+1. `DurableObjectBackingPersistence.layer` — produces a
+   `BackingPersistence` from `state.storage`.
+2. `Chat.layerPersisted({ storeId: "chat" })` — produces a
+   `Chat.Persistence` keyed by chat id, persisted via the backing.
+3. `languageModel` — the Workers AI `LanguageModel.LanguageModel`.
+
+`persistence.getOrCreate("session")` looks up the chat by id; on
+the first call it creates a fresh empty one and saves it, on every
+subsequent call it rehydrates the saved history from
+`state.storage`. The DO instance itself is the session boundary —
+each unique DO name is its own conversation.
+
+## Expose a `send` RPC method
+
+Add a method that takes a prompt, runs `generateText` against the
+persisted chat, and returns the new assistant message plus the
+conversation length:
+
+```diff lang="typescript"
+return Effect.gen(function* () {
+  const persistence = yield* Chat.Persistence;
+  const chat = yield* persistence.getOrCreate("session");
+-  return {};
++  return {
++    send: (prompt: string) =>
++      Effect.gen(function* () {
++        const response = yield* chat.generateText({ prompt });
++        const history = yield* Ref.get(chat.history);
++        return { text: response.text, turns: history.content.length };
++      }).pipe(Effect.orDie),
++  };
+}).pipe(
+  Effect.provide(languageModel),
+  Effect.provide(Chat.layerPersisted({ storeId: "chat" })),
+  Effect.provide(Cloudflare.DurableObjectBackingPersistence.layer),
+);
+```
+
+`chat.generateText` does three things in one call: appends the user
+message to history, calls the language model, appends the assistant
+response, and saves the updated history back through
+`Chat.Persistence`. Crash mid-flight, restart the DO, send another
+prompt, and the next turn picks up exactly where the last completed
+one left off.
+
+## Bind the DO and route to it
+
+In your Worker's init phase, yield the DO class to register the
+binding, then forward `/chat?id=…` to the matching instance:
+
+```diff lang="typescript"
+// src/Api.ts
+import * as Cloudflare from "alchemy/Cloudflare";
++import ChatAgent from "./ChatAgent.ts";
+
+export default class Api extends Cloudflare.Worker<Api>()(
+  "Api",
+  { main: import.meta.path },
+  Effect.gen(function* () {
++   const chatAgents = yield* ChatAgent;
+
+    return {
+      fetch: Effect.gen(function* () {
+        const request = yield* HttpServerRequest;
+        const url = new URL(request.url, "http://api");
+
++       if (url.pathname === "/chat") {
++         const id = url.searchParams.get("id") ?? "default";
++         const prompt = url.searchParams.get("prompt") ?? "";
++         const result = yield* chatAgents.getByName(id).send(prompt);
++         return yield* HttpServerResponse.json(result);
++       }
+
+        // …existing routes
+      }),
+    };
+  }),
+) {}
+```
+
+`chatAgents.getByName(id)` returns a typed RPC stub —
+`send(prompt): Effect<{ text: string; turns: number }>` — and the
+runtime ferries the call to the DO whose name matches `id`. Each
+unique `id` is a separate conversation backed by its own DO storage.
+
+## Try it
+
+Deploy and have a two-turn conversation against the same chat id:
+
+```sh
+bun alchemy deploy
+
+curl "$(bun alchemy stack output url)/chat?id=alice&prompt=My%20name%20is%20Sam.%20Remember%20it."
+# → {"text":"Got it, Sam!","turns":2}
+
+curl "$(bun alchemy stack output url)/chat?id=alice&prompt=What%20is%20my%20name%3F"
+# → {"text":"Your name is Sam.","turns":4}
+```
+
+The second request lands in the *same* DO instance as the first
+(idFromName collisions are deterministic). Even if Cloudflare had
+hibernated the DO between the two calls, the persisted history is
+read back from `state.storage` before the model runs — the model
+sees the full conversation, not just the latest prompt.
+
+Hit `/chat?id=bob&prompt=…` and you're talking to a brand-new
+conversation in a brand-new DO. Each id is a session; each session
+is durable; no extra database, queue, or KV store needed.
+
+## What you have now
+
+- A Workers AI `LanguageModel` exposed through your AI Gateway,
+  with caching, rate limiting, and logs intact.
+- A `Chat.Persistence` layered on top of `state.storage` via
+  `DurableObjectBackingPersistence` — drop-in compatible with
+  every other Effect AI helper (`generateObject`, tool-calls, …).
+- A typed `ChatAgent` DO with a single `send` RPC method that does
+  one full conversation turn — load history, generate, save.
+
+Every layer in this stack is independently swappable: replace
+`AiGatewayLanguageModel` with `OpenAiLanguageModel` and you're
+talking to GPT instead, without touching the persistence code; swap
+`DurableObjectBackingPersistence` for `Persistence.layerBackingMemory`
+in tests and you keep history in-process; add tools to the chat by
+passing a `toolkit` to `generateText`. The DO body doesn't need to
+change for any of those.

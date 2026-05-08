@@ -40,6 +40,12 @@ export interface AiGatewayClient {
    */
   gateway: Effect.Effect<AiGateway, never, WorkerEnvironment>;
   /**
+   * Effect resolving to the gateway id (the resource attribute, captured at
+   * bind time). Useful when calling `ai.run(model, inputs, { gateway: { id } })`
+   * — the in-account path for first-party services like Workers AI.
+   */
+  id: Effect.Effect<string, never, WorkerEnvironment>;
+  /**
    * Update metadata on an existing AI Gateway log entry.
    */
   patchLog(
@@ -134,6 +140,7 @@ export const AiGatewayBindingLive = Layer.effect(
       return {
         raw: ai,
         gateway: runtimeGateway,
+        id: gatewayIdAccessor,
         patchLog: (logId, data) =>
           use((gateway) => gateway.patchLog(logId, data)),
         getLog: (logId) => use((gateway) => gateway.getLog(logId)),

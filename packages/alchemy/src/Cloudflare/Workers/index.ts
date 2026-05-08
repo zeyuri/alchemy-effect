@@ -1,4 +1,5 @@
 export * from "./Assets.ts";
+export * as DurableObjectBackingPersistence from "./BackingPersistence.ts";
 export * from "./ConfigProvider.ts";
 export * from "./DurableObjectNamespace.ts";
 export * from "./DurableObjectState.ts";
